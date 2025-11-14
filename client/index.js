@@ -1,4 +1,4 @@
-const socket = io("http://localhost:3000");
+const socket = new WebSocket("ws://localhost:3000/ws");
 
 // Окна
 const loginWindow = document.getElementById("login");
@@ -31,11 +31,21 @@ let currentUser = null;
 let currentRoom = null;
 let typingTimer = null;
 
+// Функция отправки события на сервер
+function emit(eventType, data) {
+    if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: eventType, data }));
+        console.log("emit", eventType, data);
+    } else {
+        console.error("WebSocket not connected");
+    }
+}
+
 // Добавление сообщения
 function appendMessage(message) {
     const container = document.createElement("div");
     container.className = "message-item";
-    container.dataset.id = message.id || ("sys-" + Date.now());
+    container.dataset.id = message.id || ("temp-" + Date.now());
 
     const messageContent = document.createElement("div");
     messageContent.className = "message-content";
@@ -67,32 +77,32 @@ function appendMessage(message) {
     const reactionBtn = container.querySelector(".message__reaction");
     reactionBtn.addEventListener("click", () => {
         const messageId = message.id;
-        socket.emit("likeMessage", { user: currentUser, messageId });
-        console.log("client: likeMessage", messageId);
+        emit("likeMessage", { user: currentUser, messageId });
+        console.log(`User ${currentUser} liked message`, messageId);
     });
 }
 
 // Авторизация
 loginButton.addEventListener("click", () => {
     const username = loginInput.value.trim();
-    if (!username) return alert("Введите username");
+    if (!username) return alert("Введите имя пользователя");
     
     currentUser = username;
     loginWindow.style.display = "none";
     chatWindow.style.display = "flex";
     chatNotice.style.display = "flex";
     
-    socket.emit("login", { user: currentUser });
-    console.log("client: emit login", currentUser);
+    emit("login", { user: currentUser });
+    console.log(`User ${currentUser} logged in`);
 });
 
 // Выход из чата
 chatExitButton.addEventListener("click", () => {
-    if (currentUser) socket.emit("logout", currentUser);
+    if (currentUser) emit("logout", currentUser);
     
     chatWindow.style.display = "none";
     loginWindow.style.display = "flex";
-    console.log("client: logout", currentUser);
+    console.log(`User ${currentUser} logged out`);
     
     currentUser = null;
     currentRoom = null;
@@ -111,7 +121,7 @@ roomCreateButton.addEventListener("click", () => {
     
     if (!roomName || !roomType) return alert("Введите все поля");
     
-    socket.emit("createRoom", { 
+    emit("createRoom", { 
         roomName: roomName, 
         type: roomType === "private" ? "private" : "public", 
         members, 
@@ -119,7 +129,7 @@ roomCreateButton.addEventListener("click", () => {
     });
     
     roomCreateWindow.style.display = "none";
-    console.log("client: createRoom", roomName, roomType, members);
+    console.log(`User ${currentUser} created room ${roomName}`);
 });
 
 // Закрытие окна создания комнаты
@@ -157,17 +167,17 @@ joinOrLeaveButton.addEventListener("click", () => {
     const action = document.querySelector('input[name="room-actions-type"]:checked')?.value;
     const roomName = document.getElementById("room-actions__input").value.trim();
     
-    if (!action || !roomName) return alert("Заполните инпут");
+    if (!action || !roomName) return alert("Заполните поле");
     
     if (action === "join") {
-        socket.emit("joinRoom", { user: currentUser, room: roomName });
+        emit("joinRoom", { user: currentUser, room: roomName });
         currentRoom = roomName;
         document.getElementById("chat__room-name").textContent = roomName;
         chatNotice.style.display = "none";
-        console.log("client: joinRoom", roomName);
+        console.log(`User ${currentUser} joined room ${roomName}`);
     } else {
-        socket.emit("leaveRoom", { user: currentUser, room: roomName });
-        console.log("client: leaveRoom", roomName);
+        emit("leaveRoom", { user: currentUser, room: roomName });
+        console.log(`User ${currentUser} left room ${roomName}`);
         if (currentRoom === roomName) currentRoom = null;
     }
     
@@ -184,23 +194,30 @@ sendMessageButton.addEventListener("click", () => {
     const messageText = messageInput.value.trim();
     if (!messageText) return;
     if (!currentRoom) return alert("Сначала присоединитесь к комнате");
-    if (messageText.length > 300) return alert("Сообщение слишком большое");
+    if (messageText.length > 300) return alert("Сообщение слишком длинное");
     
-    socket.emit("message", { user: currentUser, room: currentRoom, text: messageText });
+    emit("message", { user: currentUser, room: currentRoom, text: messageText });
     messageInput.value = "";
-    console.log("client: message sent");
+    console.log(`User ${currentUser} sent a message`);
 });
 
-// Набор сообщения
+// + Enter
+messageInput.addEventListener("keypress", (e) => {
+    if (e.key === "Enter") {
+        sendMessageButton.click();
+    }
+});
+
+// ОВВод сообщения
 messageInput.addEventListener("input", () => {
     if (!currentUser || !currentRoom) return;
     
-    socket.emit("typing", { user: currentUser, room: currentRoom });
+    emit("typing", { user: currentUser });
     
-    // Таймер для остановки индикатора
+    // Таймер
     if (typingTimer) clearTimeout(typingTimer);
     typingTimer = setTimeout(() => {
-        socket.emit("typing", { user: currentUser, room: currentRoom });
+        emit("typing", { user: currentUser });
     }, 1000);
 });
 
@@ -211,73 +228,88 @@ if (reaction) {
     });
 }
 
-// Офлайн-сообщения
-socket.on("offlineMessages", (messages) => {
-    console.log("socket: offlineMessages", messages);
-    alert(`У вас ${messages.length} офлайн сообщений`);
-    messages.forEach(message => appendMessage({ 
-        id: message.id, 
-        text: message.text, 
-        from: message.from, 
-        createdAt: message.createdAt 
-    }));
-});
-
-// Новое сообщение
-socket.on("roomMessage", (messageData) => {
-    console.log("socket: roomMessage", messageData);
-    appendMessage(messageData);
-});
-
-// Присоединение к комнате
-socket.on("joinedRoom", (roomInfo) => {
-    console.log("socket: joinedRoom", roomInfo);
-    if (roomInfo.roomName) {
-        currentRoom = roomInfo.roomName;
-        document.getElementById("chat__room-name").textContent = roomInfo.roomName;
+// Серверные сообщения
+socket.onmessage = (event) => {
+    try {
+        const message = JSON.parse(event.data);
+        console.log("socket message:", message.type, message.data);
+        
+        switch (message.type) {
+            case "offlineMessages":
+                alert(`У вас ${message.data.length} офлайн сообщений`);
+                message.data.forEach(msg => appendMessage({ 
+                    id: msg.id, 
+                    text: msg.text, 
+                    from: msg.from, 
+                    createdAt: msg.createdAt 
+                }));
+                break;
+                
+            case "roomMessage":
+                appendMessage(message.data);
+                break;
+                
+            case "joinedRoom":
+                if (message.data.roomName) {
+                    currentRoom = message.data.roomName;
+                    document.getElementById("chat__room-name").textContent = message.data.roomName;
+                }
+                break;
+                
+            case "roomUsers":
+                document.getElementById("chat__room-members").textContent = "Участники: " + (message.data?.length ?? 0);
+                break;
+                
+            case "userStatusChanged":
+                console.log("User status changed:", message.data);
+                break;
+                
+            case "mentionNotification":
+                alert(`Вас упомянул ${message.data.from} в ${message.data.room}`);
+                break;
+                
+            case "messageLiked":
+                const messageElement = document.querySelector(`[data-id="${message.data.messageId}"]`);
+                if (messageElement) {
+                    const likeCountElement = messageElement.querySelector(".like-count");
+                    if (likeCountElement) likeCountElement.textContent = ` ${message.data.likesCount}`;
+                }
+                break;
+                
+            case "errorMessage":
+                alert(message.data.message || "Ошибка");
+                break;
+                
+            case "roomCreated":
+                console.log("Room created:", message.data);
+                break;
+                
+            case "newOfflineMessageNotification":
+                alert(`Новое офлайн сообщение от ${message.data.from} в ${message.data.room}`);
+                break;
+                
+            default:
+                console.log("Unknown message type:", message.type);
+        }
+    } catch (error) {
+        console.error("Message parsing error:", error);
     }
-});
+};
 
-// Обновление списка пользователей в комнате
-socket.on("roomUsers", (users) => {
-    console.log("socket: roomUsers", users);
-    document.getElementById("chat__room-members").textContent = "Members: " + (users?.length ?? 0);
-});
+socket.onopen = () => {
+    console.log("Connected to Bun WebSocket server");
+};
 
-// Изменение статуса пользователя
-socket.on("userStatusChanged", (userData) => {
-    console.log("socket: userStatusChanged", userData);
-});
+socket.onclose = () => {
+    console.log("Connection closed");
+};
 
-// Уведомление об упоминании
-socket.on("mentionNotification", (notification) => {
-    console.log("socket: mentionNotification", notification);
-    alert(`Вас упомянул ${notification.from} в ${notification.room}`);
-});
+socket.onerror = (error) => {
+    console.error("WebSocket error:", error);
+};
 
-// Обновление лайков сообщения
-socket.on("messageLiked", (likeData) => {
-    console.log("socket: messageLiked", likeData);
-    const messageElement = document.querySelector(`[data-id="${likeData.messageId}"]`);
-    if (messageElement) {
-        const likeCountElement = messageElement.querySelector(".like-count");
-        if (likeCountElement) likeCountElement.textContent = ` ${likeData.likesCount}`;
+window.addEventListener("beforeunload", () => {
+    if (currentUser) {
+        emit("logout", currentUser);
     }
-});
-
-// Ошибки от сервера
-socket.on("errorMessage", (errorData) => {
-    console.log("socket: errorMessage", errorData);
-    alert(errorData.message || "Ошибка");
-});
-
-// Создание новой комнаты
-socket.on("roomCreated", (room) => {
-    console.log("socket: roomCreated", room);
-});
-
-// Уведомление о новом офлайн-сообщении
-socket.on("newOfflineMessageNotification", (notification) => {
-    console.log("socket: newOfflineMessageNotification", notification);
-    alert(`Новое офлайн сообщение от ${notification.from} в ${notification.room}`);
 });

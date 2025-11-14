@@ -1,43 +1,151 @@
-import express, { Application } from "express";
-import http, { Server } from "http";
-import { Server as IOServer, Socket } from "socket.io";
-import cors from "cors";
 import { PrismaClient } from "./generated/prisma";
 
-export class SocketServer {
-    private app: Application;
-    private httpServer: Server;
-    private io: IOServer;
+interface WebSocketData {
+    username: string | null;
+    rooms: string[];
+}
+
+interface LoginData {
+    user: string;
+    roomName?: string;
+}
+
+interface CreateRoomData {
+    roomName: string;
+    type: "private" | "public";
+    members?: string[];
+    inviter?: string;
+}
+
+interface JoinRoomData {
+    user: string;
+    room: string;
+}
+
+interface LeaveRoomData {
+    user: string;
+    room?: string;
+}
+
+interface TypingData {
+    user: string;
+    room: string;
+}
+
+interface MessageData {
+    user: string;
+    room: string;
+    text: string;
+}
+
+interface LikeMessageData {
+    user: string;
+    messageId?: string;
+}
+
+export class BunSocketServer {
     private prisma = new PrismaClient();
+    private server!: Bun.Server<WebSocketData>;
+    private readonly PORT = Number(Bun.env.PORT || 3000);
 
-    private readonly PORT = Number(process.env.PORT || 3000);
-
-    // таймеры
-    private typingTimers = new Map<string, NodeJS.Timeout>();
-    private awayTimers = new Map<string, NodeJS.Timeout>();
+    // Таймеры
+    private typingTimers = new Map<string, Timer>();
+    private awayTimers = new Map<string, Timer>();
     private lastMessageMap = new Map<string, { text: string; ts: number }>();
 
-    // Сервер
     constructor() {
-        this.app = express();
-        this.httpServer = http.createServer(this.app);
-        this.io = new IOServer(this.httpServer, {
-            cors: { origin: "*", methods: ["GET", "POST"] }
-        });
-
-        this.app.use(cors());
-
-        this.configureRoutes();
-        this.configureSocketEvents();
+        this.configureServer();
         this.start();
     }
 
-    private configureRoutes() {
-        this.app.get("/", (_req, res) => res.send("Hello World!"));
+    private configureServer() {
+        this.server = Bun.serve<WebSocketData>({ 
+            port: this.PORT,
+            
+            fetch: (req, server) => {
+                const url = new URL(req.url);
+                
+                if (url.pathname === "/") {
+                    return new Response("Hello World!");
+                }
+
+                if (url.pathname === "/ws") {
+                    const success = server.upgrade(req, {
+                        data: {
+                            username: null,
+                            rooms: []
+                        }
+                    });
+                    
+                    return success ? undefined : new Response("WebSocket upgrade failed", { status: 400 });
+                }
+
+                return new Response("Not found", { status: 404 });
+            },
+
+            websocket: {
+                idleTimeout: 300,
+                maxPayloadLength: 64 * 1024,
+                perMessageDeflate: true,
+                
+                open: (ws) => {
+                    console.log("socket: connected", ws.remoteAddress);
+                },
+
+                message: async (ws, message) => {
+                    try {
+                        const data = JSON.parse(message.toString());
+                        await this.handleSocketEvent(ws, data);
+                    } catch (error) {
+                        console.error("Message parsing error:", error);
+                        this.sendError(ws, "Invalid message format");
+                    }
+                },
+
+                close: (ws, code, reason) => {
+                    console.log("socket: disconnected", ws.remoteAddress, code, reason);
+                    this.handleDisconnect(ws);
+                }
+            }
+        });
+    }
+
+    private async handleSocketEvent(ws: any, data: any) {
+        const eventType = data.type;
+        const eventData = data.data;
+
+        switch (eventType) {
+            case "login":
+                await this.loginUser(ws, eventData);
+                break;
+            case "createRoom":
+                await this.createRoom(ws, eventData);
+                break;
+            case "joinRoom":
+                await this.joinRoom(ws, eventData);
+                break;
+            case "leaveRoom":
+                await this.leaveRoom(ws, eventData);
+                break;
+            case "typing":
+                await this.typing(ws, eventData);
+                break;
+            case "message":
+                await this.message(ws, eventData);
+                break;
+            case "likeMessage":
+                await this.likeMessage(ws, eventData);
+                break;
+            case "logout":
+                await this.logout(ws, eventData);
+                break;
+            default:
+                this.sendError(ws, "Unknown event type");
+        }
     }
 
     // Поиск @
-    private extractionMentions (text: string) {
+    private extractionMentions(text: string) {
         const pattern = /@([a-zA-Z0-9_]+)/g;
         const names = new Set<string>();
         let match: RegExpExecArray | null;
@@ -59,59 +167,32 @@ export class SocketServer {
                 where: { username },
                 data: { status: "away" }
             });
-            this.io.emit("userStatusChanged", { username, status: "away" });
+            this.broadcastToAll("userStatusChanged", { username, status: "away" });
             this.awayTimers.delete(username);
         }, 60000);
 
         this.awayTimers.set(username, timer);
     }
 
-    private configureSocketEvents() {
-        this.io.on("connection", (socket: Socket) => {
-            console.log("socket: connected", socket.id);
-            socket.data.username = null;
-
-            // События
-            socket.on("login", (data) => 
-                this.loginUser(socket, data));
-            socket.on("createRoom", (data) => 
-                this.createRoom(socket, data));
-            socket.on("joinRoom", (data) => 
-                this.joinRoom(socket, data));
-            socket.on("leaveRoom", (data) => 
-                this.leaveRoom(socket, data));
-            socket.on("typing", (data) => 
-                this.typing(socket, data));
-            socket.on("message", (data) => 
-                this.message(socket, data));
-            socket.on("likeMessage", (data) => 
-                this.likeMessage(socket, data));
-            socket.on("logout", (username) => 
-                this.logout(socket, username));
-            socket.on("disconnect", (reason) => 
-                this.disconnect(socket, reason));
-        });
-    }
-
-    // Авторизация
-    private async loginUser(socket: Socket, data: { user: string; roomName?: string }) {
+    // Авторизация пользователя
+    private async loginUser(ws: any, data: LoginData) {
         try {
             const username = data.user;
-            socket.data.username = username;
-            socket.join(`user:${username}`);
+            ws.data.username = username;
+            ws.subscribe(`user:${username}`);
 
-            // Создание юзера
+            // Создание или обновление пользователя
             const user = await this.prisma.user.upsert({
                 where: { username },
                 update: { status: "online", nowRoom: data.roomName ?? null },
                 create: { username, status: "online", nowRoom: data.roomName ?? null }
             });
 
-            // Присоединение к комнате если есть
+            // Присоединение к комнате если указана
             if (data.roomName) {
                 const room = await this.prisma.room.findUnique({ where: { name: data.roomName } });
 
-                // Для приватных комнат
+                // Приватная комната
                 if (room?.isPrivate) {
                     const allowedUsers = (room.allowedUsers ?? "").split(",").map(user => user.trim());
                     const invite = await this.prisma.roomInvite.findFirst({
@@ -119,9 +200,11 @@ export class SocketServer {
                     });
 
                     if (!allowedUsers.includes(username) && !invite) {
-                        socket.emit("errorMessage", { message: "У вас нет доступа в приватную комнату" });
+                        this.sendError(ws, "У вас нет доступа в приватную комнату");
+                        return;
                     } else {
-                        socket.join(data.roomName);
+                        ws.subscribe(data.roomName);
+                        ws.data.rooms.push(data.roomName);
                     }
                 } else {
                     // Публичная комната
@@ -129,13 +212,14 @@ export class SocketServer {
                         const newRoom = await this.prisma.room.create({
                             data: { name: data.roomName, isPrivate: false }
                         });
-                        this.io.emit("roomCreated", { name: newRoom.name, isPrivate: newRoom.isPrivate });
+                        this.broadcastToAll("roomCreated", { name: newRoom.name, isPrivate: newRoom.isPrivate });
                     }
-                    socket.join(data.roomName);
+                    ws.subscribe(data.roomName);
+                    ws.data.rooms.push(data.roomName);
                 }
             }
 
-            // Оффлайн-сообщения
+            // Получение офлайн-сообщений
             const dbUser = await this.prisma.user.findUnique({ where: { username } });
 
             if (dbUser) {
@@ -145,7 +229,7 @@ export class SocketServer {
                 });
 
                 if (unreadMessages.length) {
-                    socket.emit("offlineMessages", unreadMessages.map(unread => ({
+                    this.sendToSocket(ws, "offlineMessages", unreadMessages.map(unread => ({
                         id: unread.messageId,
                         text: unread.message.text,
                         from: unread.message.user.username,
@@ -157,11 +241,11 @@ export class SocketServer {
                 }
             }
 
-            // Уведомение об онлайне
-            this.io.emit("userStatusChanged", { username, status: "online", nowRoom: data.roomName ?? null });
+            // Онлайн
+            this.broadcastToAll("userStatusChanged", { username, status: "online", nowRoom: data.roomName ?? null });
 
             // Данные о присоединении
-            socket.emit("joinedRoom", {
+            this.sendToSocket(ws, "joinedRoom", {
                 roomName: data.roomName ?? null,
                 role: user.role ?? 1,
                 isMuted: user.isMuted ?? false
@@ -170,7 +254,7 @@ export class SocketServer {
             // Список пользователей в комнате
             if (data.roomName) {
                 const users = await this.prisma.user.findMany({ where: { nowRoom: data.roomName } });
-                socket.emit("roomUsers", users.map(user => ({
+                this.sendToSocket(ws, "roomUsers", users.map(user => ({
                     username: user.username,
                     status: user.status,
                     role: user.role,
@@ -181,20 +265,23 @@ export class SocketServer {
             await this.resetAway(username);
         } catch (err) {
             console.error(err);
-            socket.emit("errorMessage", { message: "Ошибка логина" });
+            this.sendError(ws, "Ошибка логина");
         }
     }
 
     // Создание комнаты
-    private async createRoom(socket: Socket, data: { roomName: string; type: "private" | "public"; members?: string[]; inviter?: string }) {
+    private async createRoom(ws: any, data: CreateRoomData) {
         const exists = await this.prisma.room.findUnique({ where: { name: data.roomName } });
-        if (exists) return socket.emit("errorMessage", { message: "Комната уже существует" });
+        if (exists) {
+            this.sendError(ws, "Комната уже существует");
+            return;
+        }
 
         const room = await this.prisma.room.create({
             data: {
                 name: data.roomName,
                 isPrivate: data.type === "private",
-                allowedUsers: (data.members ?? []).join(",")  // Список разрешенных пользователей
+                allowedUsers: (data.members ?? []).join(",")
             }
         });
 
@@ -207,15 +294,18 @@ export class SocketServer {
             }
         }
 
-        this.io.emit("roomCreated", { name: room.name, isPrivate: room.isPrivate });
+        this.broadcastToAll("roomCreated", { name: room.name, isPrivate: room.isPrivate });
     }
 
     // Присоединение к комнате
-    private async joinRoom(socket: Socket, data: { user: string; room: string }) {
+    private async joinRoom(ws: any, data: JoinRoomData) {
         const room = await this.prisma.room.findUnique({ where: { name: data.room } });
-        if (!room) return socket.emit("errorMessage", { message: "Такой комнаты не существует" });
+        if (!room) {
+            this.sendError(ws, "Такой комнаты не существует");
+            return;
+        }
 
-        // Проверка доступа к приватной комнате
+        // Доступ к приватной комнате
         if (room.isPrivate) {
             const allowedUsers = (room.allowedUsers ?? "").split(",").map(user => user.trim());
             const invite = await this.prisma.roomInvite.findFirst({
@@ -223,35 +313,41 @@ export class SocketServer {
             });
 
             if (!allowedUsers.includes(data.user) && !invite) {
-                return socket.emit("errorMessage", { message: "Нет доступа" });
+                this.sendError(ws, "Нет доступа");
+                return;
             }
         }
 
-        socket.join(data.room);
+        ws.subscribe(data.room);
+        ws.data.rooms.push(data.room);
+
         await this.prisma.user.updateMany({
             where: { username: data.user },
             data: { nowRoom: data.room, status: "online" }
         });
 
-        // Уведомление о участнике
-        this.io.to(data.room).emit("roomMessage", { message: `${data.user} присоединился` });
-        this.io.emit("userStatusChanged", { username: data.user, status: "online", nowRoom: data.room });
+        // Уведомление о новом участнике
+        this.broadcastToRoom(data.room, "roomMessage", { message: `${data.user} присоединился` });
+        this.broadcastToAll("userStatusChanged", { username: data.user, status: "online", nowRoom: data.room });
         this.resetAway(data.user);
     }
 
     // Выход из комнаты
-    private async leaveRoom(socket: Socket, data: { user: string; room?: string }) {
+    private async leaveRoom(ws: any, data: LeaveRoomData) {
         const username = data.user;
-        const roomName = data.room ?? [...socket.rooms].find(room => !room.startsWith("user:") && room !== socket.id);
+        const roomName = data.room ?? ws.data.rooms.find((room: string) => !room.startsWith("user:"));
         if (!roomName) return;
 
-        socket.leave(roomName);
+        ws.unsubscribe(roomName);
+        ws.data.rooms = ws.data.rooms.filter((room: string) => room !== roomName);
+
         await this.prisma.user.updateMany({ where: { username }, data: { nowRoom: null } });
-        this.io.to(roomName).emit("roomMessage", { message: `${username} вышел из комнаты` });
-        this.io.emit("userStatusChanged", { username, status: "online", nowRoom: null });
+        this.broadcastToRoom(roomName, "roomMessage", { message: `${username} вышел из комнаты` });
+        this.broadcastToAll("userStatusChanged", { username, status: "online", nowRoom: null });
     }
 
-    private async typing(_socket: Socket, data: { user: string }) {
+    // Набор
+    private async typing(ws: any, data: TypingData) {
         const username = data.user;
 
         // Сброс таймера
@@ -261,11 +357,11 @@ export class SocketServer {
         }
 
         await this.prisma.user.updateMany({ where: { username }, data: { status: "typing" } });
-        this.io.emit("userStatusChanged", { username, status: "typing" });
+        this.broadcastToAll("userStatusChanged", { username, status: "typing" });
 
         const timer = setTimeout(async () => {
             await this.prisma.user.updateMany({ where: { username }, data: { status: "online" } });
-            this.io.emit("userStatusChanged", { username, status: "online" });
+            this.broadcastToAll("userStatusChanged", { username, status: "online" });
             this.typingTimers.delete(username);
         }, 3000);
 
@@ -274,16 +370,20 @@ export class SocketServer {
     }
 
     // Отправка сообщения
-    private async message(socket: Socket, data: { user: string; room: string; text: string }) {
+    private async message(ws: any, data: MessageData) {
         const username = data.user;
         const text = data.text.trim();
-        if (!text) return socket.emit("errorMessage", { message: "Пустое сообщение" });
+        if (!text) {
+            this.sendError(ws, "Пустое сообщение");
+            return;
+        }
 
         // Антиспам
         const lastMessage = this.lastMessageMap.get(username);
         const now = Date.now();
         if (lastMessage && lastMessage.text === text && now - lastMessage.ts < 5000) {
-            return socket.emit("errorMessage", { message: "Нельзя спамить!" });
+            this.sendError(ws, "Нельзя спамить!");
+            return;
         }
 
         this.lastMessageMap.set(username, { text, ts: now });
@@ -292,10 +392,13 @@ export class SocketServer {
         const dbRoom = await this.prisma.room.findUnique({ where: { name: data.room } });
         if (!dbUser || !dbRoom) return;
 
-        // Пред
-        if (dbUser.isMuted) return socket.emit("errorMessage", { message: "Вам ничего нельзя" });
+        // Мут
+        if (dbUser.isMuted) {
+            this.sendError(ws, "Вам ничего нельзя");
+            return;
+        }
 
-        const mentions = this.extractionMentions (text);
+        const mentions = this.extractionMentions(text);
         const message = await this.prisma.message.create({
             data: {
                 text,
@@ -307,7 +410,7 @@ export class SocketServer {
         });
 
         // Отправка сообщения в комнату
-        this.io.to(data.room).emit("roomMessage", {
+        this.broadcastToRoom(data.room, "roomMessage", {
             id: message.id,
             text,
             from: dbUser.username,
@@ -316,6 +419,7 @@ export class SocketServer {
         });
 
         const users = await this.prisma.user.findMany({ where: { nowRoom: data.room } });
+
         // Уведомления об упоминаниях
         for (const user of users) {
             if (user.username === username) continue;
@@ -323,23 +427,20 @@ export class SocketServer {
                 await this.prisma.unreadMessage.create({
                     data: { messageId: message.id, userId: user.id }
                 });
-                this.io.to(`user:${user.username}`).emit("newOfflineMessageNotification", { from: username, room: data.room });
+                this.broadcastToUser(user.username, "newOfflineMessageNotification", { from: username, room: data.room });
             }
         }
 
         for (const mention of mentions) {
-            this.io.to(`user:${mention}`).emit("mentionNotification", { from: username, room: data.room, text });
+            this.broadcastToUser(mention, "mentionNotification", { from: username, room: data.room, text });
         }
 
         this.resetAway(username);
     }
 
     // Лайк сообщения
-    private async likeMessage(_socket: Socket, data: { user: string; messageId?: string }) {
-
-        if (!data.messageId) {
-            return;
-        }
+    private async likeMessage(ws: any, data: LikeMessageData) {
+        if (!data.messageId) return;
 
         const user = await this.prisma.user.findUnique({
             where: { username: data.user }
@@ -366,7 +467,7 @@ export class SocketServer {
             include: { user: true }
         });
 
-        this.io.emit("messageLiked", {
+        this.broadcastToAll("messageLiked", {
             messageId: data.messageId,
             likesCount: likes.length,
             likedBy: likes.map(like => like.user.username)
@@ -374,33 +475,54 @@ export class SocketServer {
     }
 
     // Выход из системы
-    private async logout(socket: Socket, username: string) {
+    private async logout(ws: any, username: string) {
         await this.prisma.user.updateMany({ where: { username }, data: { status: "offline", nowRoom: null } });
-        this.io.emit("userStatusChanged", { username, status: "offline" });
+        this.broadcastToAll("userStatusChanged", { username, status: "offline" });
 
-        for (const room of socket.rooms) {
-            if (!room.startsWith("user:") && room !== socket.id) {
-                socket.leave(room);
-                this.io.to(room).emit("roomMessage", { message: `${username} вышел из комнаты` });
+        for (const room of ws.data.rooms) {
+            if (!room.startsWith("user:")) {
+                ws.unsubscribe(room);
+                this.broadcastToRoom(room, "roomMessage", { message: `${username} вышел из комнаты` });
             }
         }
+
+        ws.data.rooms = [];
     }
 
     // Отключение
-    private async disconnect(socket: Socket, reason: string) {
-        const username = socket.data.username;
+    private async handleDisconnect(ws: any) {
+        const username = ws.data.username;
         if (username) {
             await this.prisma.user.updateMany({ where: { username }, data: { status: "offline", nowRoom: null } });
-            this.io.emit("userStatusChanged", { username, status: "offline" });
+            this.broadcastToAll("userStatusChanged", { username, status: "offline" });
         }
+    }
+
+    // Доп.
+    private sendToSocket(ws: any, event: string, data: any) {
+        ws.send(JSON.stringify({ type: event, data }));
+    }
+
+    private sendError(ws: any, message: string) {
+        this.sendToSocket(ws, "errorMessage", { message });
+    }
+
+    private broadcastToAll(event: string, data: any) {
+        this.server.publish("*", JSON.stringify({ type: event, data }));
+    }
+
+    private broadcastToRoom(room: string, event: string, data: any) {
+        this.server.publish(room, JSON.stringify({ type: event, data }));
+    }
+
+    private broadcastToUser(username: string, event: string, data: any) {
+        this.server.publish(`user:${username}`, JSON.stringify({ type: event, data }));
     }
 
     // Запуск сервера
     private start() {
-        this.httpServer.listen(this.PORT, () =>
-            console.log(`Server running on port: ${this.PORT}`)
-        );
+        console.log(`Bun WebSocket server running on port: ${this.PORT}`);
     }
 }
 
-new SocketServer();
+new BunSocketServer();
